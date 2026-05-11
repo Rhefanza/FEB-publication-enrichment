@@ -11,11 +11,11 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 BASE_URL = "https://sinta.kemdiktisaintek.go.id"
 
-INPUT_FILE = r"D:\Proyek FEB\source data\unique_author_2_sumber_sinta.xlsx"
+INPUT_FILE = r"D:\Proyek FEB\source data\miss_author_for_scrape.xlsx"
 INPUT_SHEET = "Unique Authors"
 AUTHOR_COLUMN = "Normalized Key"
 
-OUTPUT_FILE = "garuda_sinta_nasional_2020_2026.xlsx"
+OUTPUT_FILE = "garuda_sinta_nasional_2020_2026_MISS_ONLY.xlsx"
 
 START_YEAR = 2020
 END_YEAR = 2026
@@ -24,6 +24,9 @@ USER_DATA_DIR = "sinta_browser_profile"
 
 AFFILIATION_KEYWORDS = [
     "universitas airlangga",
+    "univ airlangga",
+    "airlangga",
+    "airlngga",
     "unair",
 ]
 
@@ -38,17 +41,24 @@ DEPARTMENT_KEYWORDS = [
     "sains ekonomi islam",
     "ekonomi islam",
     "ekonomi syariah",
+    "ekonomi syari ah",
     "ekonomi syari'ah",
 
-    # Akuntansi
+    # Akuntansi / Akuntan
     "ilmu akuntansi",
     "sains akuntansi",
     "akuntansi",
+    "akuntan",
+    "pendidikan profesi akuntan",
+    "pendidikan profesi akuntan profesi",
 
     # Ekonomi
     "ilmu ekonomi",
     "sains ekonomi",
     "ekonomi pembangunan",
+
+    # Tambahan FEB
+    "pengembangan sumber daya manusia",
 ]
 
 UNKNOWN_DEPARTMENT_VALUES = [
@@ -192,11 +202,12 @@ def read_authors(limit=None):
     return authors
 
 
+
 def launch_context(playwright, headless=False):
     context = playwright.chromium.launch_persistent_context(
         USER_DATA_DIR,
         headless=headless,
-        slow_mo=80,
+        slow_mo=120,
         viewport={"width": 1366, "height": 768},
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -209,7 +220,7 @@ def launch_context(playwright, headless=False):
             "--start-maximized",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-        ],
+        ]
     )
 
     if context.pages:
@@ -218,6 +229,7 @@ def launch_context(playwright, headless=False):
         page = context.new_page()
 
     return context, page
+
 
 
 def manual_login(minutes=5):
@@ -251,22 +263,8 @@ def is_department_match(text):
     return any(keyword in text_lower for keyword in DEPARTMENT_KEYWORDS)
 
 
-def search_sinta_id(page, author_name):
-    search_url = f"{BASE_URL}/authors?q={quote_plus(author_name)}"
 
-    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(random.randint(1500, 3000))
-
-    try:
-        html = page.content()
-        body_text = clean_text(page.inner_text("body"))
-    except Exception:
-        return ""
-
-    if "Data Not Found" in body_text:
-        print(f"SKIP: Data Not Found -> {author_name}")
-        return ""
-
+def extract_candidates_from_search_page(html):
     soup = BeautifulSoup(html, "html.parser")
 
     candidate_blocks = soup.select(".list-item")
@@ -298,7 +296,12 @@ def search_sinta_id(page, author_name):
 
         affil_ok = is_affiliation_match(affil_check_text)
         dept_ok = is_department_match(dept_check_text)
-        dept_unknown = is_unknown_department(candidate_dept)
+
+        try:
+            dept_unknown = is_unknown_department(candidate_dept)
+        except NameError:
+            dept_lower = clean_text(candidate_dept).lower()
+            dept_unknown = dept_lower in ["", "-", "unknown", "none", "null", "n/a", "na"]
 
         candidates.append({
             "sinta_id": sinta_id,
@@ -311,6 +314,38 @@ def search_sinta_id(page, author_name):
             "block_text": block_text,
         })
 
+    return candidates
+
+
+def go_to_next_search_page(page):
+    selectors = [
+        "nav[aria-label='pagination-sample'] li.page-item:not(.disabled) a:has-text('Next')",
+        "ul.pagination li.page-item:not(.disabled) a:has-text('Next')",
+        "li.page-item:not(.disabled) a:has-text('Next')",
+    ]
+
+    for selector in selectors:
+        try:
+            next_btn = page.locator(selector)
+
+            if next_btn.count() > 0 and next_btn.first.is_visible():
+                old_text = clean_text(page.inner_text("body"))
+
+                next_btn.first.click(timeout=5000)
+                page.wait_for_timeout(random.randint(2000, 4000))
+
+                new_text = clean_text(page.inner_text("body"))
+
+                if old_text != new_text:
+                    return True
+
+        except Exception:
+            pass
+
+    return False
+
+
+def choose_best_sinta_candidate(candidates, author_name):
     if not candidates:
         print(f"SKIP: SINTA ID tidak terbaca -> {author_name}")
         return ""
@@ -319,17 +354,9 @@ def search_sinta_id(page, author_name):
 
     if not unair_candidates:
         print(f"SKIP: Ada hasil search, tapi tidak ada afiliasi Universitas Airlangga -> {author_name}")
-
-        for c in candidates:
-            print("  Lewati kandidat non-UNAIR:")
-            print(f"  Nama    : {c['name'] if c['name'] else '-'}")
-            print(f"  Afiliasi: {c['affil'] if c['affil'] else '-'}")
-            print(f"  Prodi   : {c['dept'] if c['dept'] else '-'}")
-            print(f"  SINTA ID: {c['sinta_id']}")
-
         return ""
 
-    # Prioritas utama: kandidat UNAIR + prodi FEB
+    # Prioritas 1: UNAIR + prodi FEB
     dept_matched = [c for c in unair_candidates if c["dept_ok"]]
 
     if dept_matched:
@@ -343,8 +370,7 @@ def search_sinta_id(page, author_name):
 
         return c["sinta_id"]
 
-    # Kalau hanya satu kandidat UNAIR dan prodinya kosong/unknown, tetap ambil
-    # Kalau prodinya muncul tapi bukan FEB, skip.
+    # Prioritas 2: hanya satu kandidat UNAIR dan prodi kosong/unknown
     if len(unair_candidates) == 1:
         c = unair_candidates[0]
 
@@ -367,6 +393,57 @@ def search_sinta_id(page, author_name):
         print(f"  SINTA ID: {c['sinta_id']}")
 
     return ""
+
+
+def search_sinta_id(page, author_name):
+    search_url = f"{BASE_URL}/authors?q={quote_plus(author_name)}"
+
+    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(random.randint(1500, 3000))
+
+    try:
+        body_text = clean_text(page.inner_text("body"))
+    except Exception:
+        return ""
+
+    if "Data Not Found" in body_text:
+        print(f"SKIP: Data Not Found -> {author_name}")
+        return ""
+
+    all_candidates = []
+    seen_page_signatures = set()
+
+    for search_page_no in range(1, 30):
+        print(f"  Cek hasil search author page {search_page_no}")
+
+        page.wait_for_timeout(random.randint(1000, 2000))
+
+        html = page.content()
+        body_text = clean_text(page.inner_text("body"))
+        signature = body_text[:2000]
+
+        if signature in seen_page_signatures:
+            print("  Stop search pagination: halaman berulang.")
+            break
+
+        seen_page_signatures.add(signature)
+
+        page_candidates = extract_candidates_from_search_page(html)
+
+        if page_candidates:
+            print(f"  Kandidat di page ini: {len(page_candidates)}")
+            all_candidates.extend(page_candidates)
+        else:
+            print("  Tidak ada kandidat terbaca di page ini.")
+
+        has_next = go_to_next_search_page(page)
+
+        if not has_next:
+            print("  Stop search pagination: tidak ada tombol Next aktif.")
+            break
+
+    return choose_best_sinta_candidate(all_candidates, author_name)
+
 
 
 def parse_garuda_page(html, author_name):
